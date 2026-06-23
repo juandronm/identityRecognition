@@ -1,0 +1,16 @@
+insightface>=0.7.3
+opencv-python>=4.8
+pillow>=10.0
+numpy>=1.24
+
+# ---------- Choose ONE of the two lines below ----------
+# GPU (NVIDIA): also requires the CUDA Toolkit 12.x installed system-wide
+#   https://developer.nvidia.com/cuda-downloads
+onnxruntime-gpu>=1.21,<1.27
+# CPU-only (any machine, no GPU required):
+# onnxruntime>=1.21
+# -------------------------------------------------------
+
+# Optional — only needed for the CUDA DLL bootstrap on Windows.
+# Remove if you do not have an NVIDIA GPU or do not want PyTorch installed.
+# torch>=2.0
