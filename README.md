@@ -1,4 +1,4 @@
-# webcam_recognition.py
+# Webcam Recognition
 
 Real-time face recognition from a webcam using **InsightFace** (RetinaFace + ArcFace).
 
