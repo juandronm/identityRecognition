@@ -63,6 +63,7 @@ _CUDA_AVAILABLE = _bootstrap_cuda()
 import cv2
 import numpy as np
 from numpy.linalg import norm
+from PIL import Image, ImageOps
 from insightface.app import FaceAnalysis
 from insightface.utils import face_align
 
@@ -71,11 +72,19 @@ from insightface.utils import face_align
 # ---------------------------------------------------------------------------
 FACES_DB      = _HERE.parent / "faces_db"   # sibling of src/ — safe regardless of cwd
 CAMERA_INDEX  = 0            # change to 1, 2 … if your webcam is not the default device
-DET_SIZE      = (640, 640)   # use (320, 320) on CPU-only for better fps
-MIN_DET_SCORE = 0.60
-MIN_SHARPNESS = 50.0
+DET_SIZE      = (1920, 1920) # GPU: upscales 720p 1.5×, stops 0.67× downscale on 1080p
+                              # CPU: use (640,640) or (320,320) for acceptable FPS
+MIN_DET_SCORE         = 0.60  # enrollment gate — strict
+MIN_DET_SCORE_RUNTIME = 0.35  # runtime gate — distant/angled faces score lower
+MIN_SHARPNESS         = 50.0  # enrollment gate — strict
+MIN_SHARPNESS_RUNTIME = 10.0  # runtime gate — distant faces are naturally blurrier
 SIM_THRESHOLD = 0.45
 ENROLL_FRAMES = 5            # good-quality frames to capture during live enrollment
+
+ZOOM_CROP     = 0.55  # center-crop fraction for 2nd detection pass (0 = disabled)
+TRACK_MAX_AGE = 1.0   # seconds to hold a track after detection disappears (FPS-independent)
+TRACK_MIN_IOU = 0.30  # min bounding-box overlap to match a detection to an existing track
+INFER_EVERY   = 1     # run full inference every N frames; display uses tracker for skipped frames
 
 # Display window — inference always runs on the full camera frame for accuracy;
 # only the rendered output is scaled to this size before imshow.
@@ -109,11 +118,34 @@ def build_app() -> FaceAnalysis:
         print("[WARN] GPU detected but onnxruntime CUDA provider could not initialise.")
         print("       Install the NVIDIA CUDA Toolkit to fix this:")
         print("       https://developer.nvidia.com/cuda-downloads")
-        print("[INFO] Falling back to CPU — consider (320, 320) det_size for better fps.")
+        print("[INFO] Falling back to CPU.")
     else:
         print("[INFO] No GPU detected — running on CPU.")
 
-    app = FaceAnalysis(name="buffalo_l", providers=providers)
+    # CPU performance tuning:
+    # - DET_SIZE=(320,320): 4× fewer pixels than 640 → roughly 3–4× faster detection.
+    #   Minimum detectable face ~30px in a 1280px-wide frame (medium–close range).
+    # - ZOOM_CROP=0: disables the second app.get() call that doubles per-frame cost.
+    #   On GPU, ZOOM_CROP helps catch distant faces; on CPU it just halves FPS.
+    # Install the NVIDIA CUDA Toolkit to unlock DET_SIZE=1920 + ZOOM_CROP for
+    # full distance-detection performance.
+    global DET_SIZE, ZOOM_CROP
+    global INFER_EVERY
+    if not cuda_in_ort:
+        if DET_SIZE[0] > 320:
+            DET_SIZE = (320, 320)
+            print("[INFO] CPU mode: det_size auto-set to (320,320) for performance.")
+        if ZOOM_CROP > 0:
+            ZOOM_CROP = 0.0
+            print("[INFO] CPU mode: ZOOM_CROP disabled (halves inference cost; enable on GPU).")
+        if INFER_EVERY < 2:
+            INFER_EVERY = 2
+            print("[INFO] CPU mode: inference every 2nd frame (tracker fills skipped frames).")
+
+    # Only load detection + recognition — skip 3D/2D landmark and gender/age models.
+    # The detection model already provides the 5-point keypoints that ArcFace needs.
+    app = FaceAnalysis(name="buffalo_l", providers=providers,
+                       allowed_modules=["detection", "recognition"])
     app.prepare(ctx_id=ctx_id, det_size=DET_SIZE)
     return app
 
@@ -128,9 +160,120 @@ def face_sharpness(face, src_img: np.ndarray) -> float:
 
 
 def quality_check(face, src_img: np.ndarray) -> bool:
-    if face.det_score < MIN_DET_SCORE:
+    if face.det_score < MIN_DET_SCORE_RUNTIME:
         return False
-    return face_sharpness(face, src_img) >= MIN_SHARPNESS
+    return face_sharpness(face, src_img) >= MIN_SHARPNESS_RUNTIME
+
+
+# ---------------------------------------------------------------------------
+# IoU + multi-scale detection + face tracker
+# ---------------------------------------------------------------------------
+
+def _iou(a: np.ndarray, b: np.ndarray) -> float:
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    if inter == 0.0:
+        return 0.0
+    return inter / ((a[2]-a[0])*(a[3]-a[1]) + (b[2]-b[0])*(b[3]-b[1]) - inter)
+
+
+def _nms_faces(faces: list, iou_thresh: float = 0.45) -> list:
+    """NMS over face detections: keep highest-score detection when boxes overlap."""
+    if len(faces) <= 1:
+        return faces
+    by_score = sorted(faces, key=lambda f: f.det_score, reverse=True)
+    keep = []
+    for f in by_score:
+        if all(_iou(f.bbox, k.bbox) < iou_thresh for k in keep):
+            keep.append(f)
+    return keep
+
+
+def detect_with_zoom(app: FaceAnalysis, frame: np.ndarray) -> list:
+    """Full-frame detection + a zoomed center-crop pass for distant/small faces."""
+    faces = list(app.get(frame))
+    if not ZOOM_CROP or ZOOM_CROP >= 1.0:
+        return _nms_faces(faces)
+
+    h, w = frame.shape[:2]
+    cx1 = int(w * (1 - ZOOM_CROP) / 2)
+    cy1 = int(h * (1 - ZOOM_CROP) / 2)
+    cx2 = int(w * (1 + ZOOM_CROP) / 2)
+    cy2 = int(h * (1 + ZOOM_CROP) / 2)
+    crop = frame[cy1:cy2, cx1:cx2]
+
+    for f in app.get(crop):
+        f.bbox[[0, 2]] += cx1
+        f.bbox[[1, 3]] += cy1
+        f.kps[:, 0]    += cx1
+        f.kps[:, 1]    += cy1
+        faces.append(f)
+
+    # Single NMS pass over all detections from both passes to remove all duplicates
+    return _nms_faces(faces)
+
+
+class Track:
+    _next_id = 0
+
+    def __init__(self, bbox: np.ndarray, kps: np.ndarray, name: str, score: float):
+        self.track_id  = Track._next_id
+        Track._next_id += 1
+        self.bbox      = bbox.copy()
+        self.kps       = kps.copy()
+        self.name      = name
+        self.score     = score
+        self.age       = 0           # frames since last matched (0 = matched this frame)
+        self.last_seen = time.time() # wall-clock time of last match (for time-based expiry)
+
+
+class FaceTracker:
+    def __init__(self):
+        self.tracks: list[Track] = []
+
+    def update(
+        self,
+        faces: list,
+        results: list[tuple[str, float]],
+    ) -> list[Track]:
+        now        = time.time()
+        detections = list(zip(faces, results))
+        matched_det: set[int] = set()
+
+        # Increment age of all existing tracks; matched ones are reset to 0 below
+        for t in self.tracks:
+            t.age += 1
+
+        # Greedy IoU matching — each track claims its best unmatched detection
+        for track in self.tracks:
+            best_iou, best_idx = TRACK_MIN_IOU - 1e-9, -1
+            for d_idx, (face, _) in enumerate(detections):
+                if d_idx in matched_det:
+                    continue
+                v = _iou(track.bbox, face.bbox)
+                if v > best_iou:
+                    best_iou, best_idx = v, d_idx
+
+            if best_idx >= 0:
+                face, (name, score) = detections[best_idx]
+                track.bbox      = face.bbox.copy()
+                track.kps       = face.kps.copy()
+                track.age       = 0
+                track.score     = score
+                track.last_seen = now
+                if track.name == "Unknown" and name != "Unknown":
+                    track.name = name  # lock identity once known — prevents flickering
+                matched_det.add(best_idx)
+
+        # Unmatched detections → new tracks
+        for d_idx, (face, (name, score)) in enumerate(detections):
+            if d_idx not in matched_det:
+                self.tracks.append(Track(face.bbox, face.kps, name, score))
+
+        # Drop tracks not seen within TRACK_MAX_AGE seconds (time-based, FPS-independent)
+        self.tracks = [t for t in self.tracks if now - t.last_seen <= TRACK_MAX_AGE]
+        return self.tracks
 
 
 # ---------------------------------------------------------------------------
@@ -158,11 +301,32 @@ def identify(embedding: np.ndarray, registry: dict) -> tuple[str, float]:
 # ---------------------------------------------------------------------------
 # Registry — load from faces_db/ at startup
 # ---------------------------------------------------------------------------
+
+def _imread_exif(path) -> np.ndarray | None:
+    """Read an image file respecting EXIF rotation.
+
+    cv2.imread() ignores the EXIF orientation tag that phone cameras embed,
+    so portrait photos saved as landscape raw data appear sideways to
+    RetinaFace and fail detection.  PIL's exif_transpose() fixes this.
+    """
+    try:
+        pil = ImageOps.exif_transpose(Image.open(str(path)))
+        return cv2.cvtColor(np.array(pil.convert("RGB")), cv2.COLOR_RGB2BGR)
+    except Exception:
+        return cv2.imread(str(path))  # fallback for non-JPEG or unreadable
 def load_registry(app: FaceAnalysis) -> dict:
     registry = {}
     if not FACES_DB.exists():
         print(f"[WARN] {FACES_DB}/ not found — starting with empty registry.")
         return registry
+
+    # Re-prepare with 640x640 for enrollment photos.  DET_SIZE (typically 1920x1920)
+    # upscales close-up portraits so faces exceed RetinaFace's largest anchor (~512 px)
+    # and go completely undetected.  640x640 is correct for close-up photos; ArcFace
+    # embeddings are extracted on a normalised 112x112 crop so quality is unaffected.
+    import onnxruntime as ort
+    _ctx_id = 0 if "CUDAExecutionProvider" in ort.get_available_providers() else -1
+    app.prepare(ctx_id=_ctx_id, det_size=(640, 640))
 
     for person_dir in sorted(FACES_DB.iterdir()):
         if not person_dir.is_dir():
@@ -172,14 +336,25 @@ def load_registry(app: FaceAnalysis) -> dict:
         for img_path in sorted(person_dir.glob("*")):
             if img_path.suffix.lower() not in {".jpg", ".jpeg", ".png", ".bmp"}:
                 continue
-            img = cv2.imread(str(img_path))
+            img = _imread_exif(img_path)
             if img is None:
+                print(f"    [SKIP] {img_path.name} — could not read file")
                 continue
             faces = app.get(img)
-            for f in faces:
-                if quality_check(f, img):
-                    embeddings.append(l2(f.embedding))
-                    break  # one face per enrollment photo is enough
+            if not faces:
+                print(f"    [SKIP] {img_path.name} — no face detected")
+                continue
+            if len(faces) > 1:
+                print(f"    [WARN] {img_path.name} — {len(faces)} faces; "
+                      f"using the largest (solo portrait photos give better accuracy)")
+            # Take the largest face — in an enrollment photo the subject should be closest
+            best = max(faces, key=lambda f: (f.bbox[2]-f.bbox[0]) * (f.bbox[3]-f.bbox[1]))
+            if best.det_score < 0.20:
+                print(f"    [SKIP] {img_path.name} — det_score {best.det_score:.2f} too low")
+                continue
+            sharp = face_sharpness(best, img)
+            print(f"    [OK]   {img_path.name} — det={best.det_score:.2f}  sharp={sharp:.1f}  faces={len(faces)}")
+            embeddings.append(l2(best.embedding))
 
         if embeddings:
             avg = np.mean(embeddings, axis=0)
@@ -189,6 +364,9 @@ def load_registry(app: FaceAnalysis) -> dict:
             print(f"  [WARN] No usable face found in {person_dir}/")
 
     print(f"[INFO] Registry loaded: {list(registry.keys()) or 'empty'}")
+
+    # Restore the runtime detection size for the webcam loop
+    app.prepare(ctx_id=_ctx_id, det_size=DET_SIZE)
     return registry
 
 
@@ -213,22 +391,24 @@ def enroll_live(
         if not ret:
             break
 
-        faces = app.get(frame)
+        faces = detect_with_zoom(app, frame)
         for f in faces:
-            if quality_check(f, frame):
-                emb = l2(f.embedding)
-                collected.append(emb)
+            # Enrollment uses the strict thresholds regardless of runtime relaxation
+            if f.det_score < MIN_DET_SCORE or face_sharpness(f, frame) < MIN_SHARPNESS:
+                continue
+            emb = l2(f.embedding)
+            collected.append(emb)
 
-                img_path = person_dir / f"webcam_{saved}.jpg"
-                crop = face_align.norm_crop(frame, landmark=f.kps)
-                cv2.imwrite(str(img_path), crop)
-                saved += 1
+            img_path = person_dir / f"webcam_{saved}.jpg"
+            crop = face_align.norm_crop(frame, landmark=f.kps)
+            cv2.imwrite(str(img_path), crop)
+            saved += 1
 
-                label = f"Capturing {len(collected)}/{ENROLL_FRAMES}"
-                x1, y1, x2, y2 = f.bbox.astype(int)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 200, 0), 2)
-                cv2.putText(frame, label, (x1, y1 - 8), FONT, 0.6, (255, 200, 0), 2)
-                break
+            label = f"Capturing {len(collected)}/{ENROLL_FRAMES}"
+            x1, y1, x2, y2 = f.bbox.astype(int)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 200, 0), 2)
+            cv2.putText(frame, label, (x1, y1 - 8), FONT, 0.6, (255, 200, 0), 2)
+            break
 
         cv2.imshow("InsightFace — Webcam Recognition", frame)
         cv2.waitKey(1)
@@ -244,24 +424,22 @@ def enroll_live(
 # ---------------------------------------------------------------------------
 # Frame annotation
 # ---------------------------------------------------------------------------
-def annotate_frame(
-    frame: np.ndarray,
-    faces: list,
-    results: list[tuple[str, float]],
-) -> None:
-    for face, (name, score) in zip(faces, results):
-        x1, y1, x2, y2 = face.bbox.astype(int)
-        color = COLOR_KNOWN if name != "Unknown" else COLOR_UNKNOWN
+def annotate_frame(frame: np.ndarray, tracks: list) -> None:
+    for track in tracks:
+        x1, y1, x2, y2 = track.bbox.astype(int)
+        color     = COLOR_KNOWN if track.name != "Unknown" else COLOR_UNKNOWN
+        thickness = 2 if track.age == 0 else 1  # thinner border for held/predicted tracks
 
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
 
-        label = f"{name}  {score:.2f}" if name != "Unknown" else "Unknown"
+        label = f"{track.name}  {track.score:.2f}" if track.name != "Unknown" else "Unknown"
         (tw, th), _ = cv2.getTextSize(label, FONT, 0.6, 2)
         cv2.rectangle(frame, (x1, y1 - th - 10), (x1 + tw + 4, y1), color, -1)
         cv2.putText(frame, label, (x1 + 2, y1 - 5), FONT, 0.6, (255, 255, 255), 2)
 
-        for kp in face.kps.astype(int):
-            cv2.circle(frame, tuple(kp), 3, COLOR_KP, -1)
+        if track.age == 0:  # keypoints only when freshly detected; stale ones are inaccurate
+            for kp in track.kps.astype(int):
+                cv2.circle(frame, tuple(kp), 3, COLOR_KP, -1)
 
 
 def draw_hud(frame: np.ndarray, registry: dict, fps: float) -> None:
@@ -326,8 +504,10 @@ def main() -> None:
 
     print("[INFO] Webcam open. Press 'r' to enroll, 'q' to quit.")
 
-    fps = 0.0
-    prev_time = time.time()
+    tracker     = FaceTracker()
+    fps         = 0.0
+    prev_time   = time.time()
+    frame_count = 0
 
     while True:
         ret, frame = cap.read()
@@ -335,12 +515,15 @@ def main() -> None:
             print("[ERROR] Failed to read frame.")
             break
 
-        # Inference runs on the full-resolution camera frame for best accuracy
-        faces = app.get(frame)
-        clear = [f for f in faces if quality_check(f, frame)]
-        results = [identify(l2(f.embedding), registry) for f in clear]
+        # Run full inference every INFER_EVERY frames; tracker holds positions for skipped frames
+        frame_count += 1
+        if frame_count % INFER_EVERY == 0:
+            faces   = detect_with_zoom(app, frame)
+            clear   = [f for f in faces if quality_check(f, frame)]
+            results = [identify(l2(f.embedding), registry) for f in clear]
+            tracker.update(clear, results)
 
-        annotate_frame(frame, clear, results)
+        annotate_frame(frame, tracker.tracks)
 
         now = time.time()
         fps = 0.9 * fps + 0.1 * (1.0 / max(now - prev_time, 1e-6))
