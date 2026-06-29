@@ -82,7 +82,7 @@ SIM_THRESHOLD = 0.45
 ENROLL_FRAMES = 5            # good-quality frames to capture during live enrollment
 
 ZOOM_CROP     = 0.55  # center-crop fraction for 2nd detection pass (0 = disabled)
-TRACK_MAX_AGE = 1.0   # seconds to hold a track after detection disappears (FPS-independent)
+TRACK_MAX_AGE = 0.4   # seconds to hold a track after detection disappears (FPS-independent)
 TRACK_MIN_IOU = 0.30  # min bounding-box overlap to match a detection to an existing track
 INFER_EVERY   = 1     # run full inference every N frames; display uses tracker for skipped frames
 
@@ -178,6 +178,26 @@ def _iou(a: np.ndarray, b: np.ndarray) -> float:
     return inter / ((a[2]-a[0])*(a[3]-a[1]) + (b[2]-b[0])*(b[3]-b[1]) - inter)
 
 
+def _match_score(track_bbox: np.ndarray, det_bbox: np.ndarray) -> float:
+    """IoU with centroid-distance fallback for fast-moving faces.
+
+    When someone moves quickly the new bbox has low IoU with the old track,
+    causing a stale ghost at the old position.  If the face centre moved less
+    than 2 face-widths we treat it as the same person and return a small
+    positive score so the track is updated rather than abandoned.
+    """
+    iou = _iou(track_bbox, det_bbox)
+    if iou >= TRACK_MIN_IOU:
+        return iou
+    tc = (track_bbox[:2] + track_bbox[2:]) * 0.5
+    dc = (det_bbox[:2]  + det_bbox[2:])  * 0.5
+    dist = float(np.linalg.norm(tc - dc))
+    fw   = float(det_bbox[2] - det_bbox[0])
+    if fw > 0 and dist < fw * 2.0:
+        return max(1e-9, TRACK_MIN_IOU * (1.0 - dist / (fw * 2.0)))
+    return 0.0
+
+
 def _nms_faces(faces: list, iou_thresh: float = 0.45) -> list:
     """NMS over face detections: keep highest-score detection when boxes overlap."""
     if len(faces) <= 1:
@@ -245,15 +265,15 @@ class FaceTracker:
         for t in self.tracks:
             t.age += 1
 
-        # Greedy IoU matching — each track claims its best unmatched detection
+        # Greedy matching — IoU first, centroid-distance fallback for fast movement
         for track in self.tracks:
-            best_iou, best_idx = TRACK_MIN_IOU - 1e-9, -1
+            best_score, best_idx = 0.0, -1
             for d_idx, (face, _) in enumerate(detections):
                 if d_idx in matched_det:
                     continue
-                v = _iou(track.bbox, face.bbox)
-                if v > best_iou:
-                    best_iou, best_idx = v, d_idx
+                v = _match_score(track.bbox, face.bbox)
+                if v > best_score:
+                    best_score, best_idx = v, d_idx
 
             if best_idx >= 0:
                 face, (name, score) = detections[best_idx]
