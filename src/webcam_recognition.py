@@ -10,6 +10,7 @@ Enrollment:
   Press  q  to quit.
 """
 
+import argparse
 import os
 import platform
 import sys
@@ -506,14 +507,63 @@ def scale_to_window(frame: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Real-time face recognition — webcam or RTSP stream",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  python src/webcam_recognition.py                          # default webcam\n"
+            "  python src/webcam_recognition.py --source 1               # webcam index 1\n"
+            "  python src/webcam_recognition.py --source rtsp://192.168.1.10:554/stream\n"
+        ),
+    )
+    parser.add_argument(
+        "--source",
+        default=None,
+        metavar="SOURCE",
+        help=(
+            "Video source: camera index (0, 1, …) or RTSP URL (rtsp://…). "
+            f"Defaults to webcam {CAMERA_INDEX}."
+        ),
+    )
+    return parser.parse_args()
+
+
+def _open_capture(source) -> cv2.VideoCapture:
+    """Open a VideoCapture from a webcam index or RTSP/file URL."""
+    is_rtsp = isinstance(source, str) and source.lower().startswith(("rtsp://", "rtsps://"))
+
+    if is_rtsp:
+        # Use FFMPEG backend for RTSP; keep buffer small to minimise latency.
+        cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        print(f"[INFO] Connecting to RTSP stream: {source}")
+    else:
+        cap = cv2.VideoCapture(source)
+        print(f"[INFO] Opening camera index {source}")
+
+    return cap
+
+
 def main() -> None:
+    args = _parse_args()
+
+    # Resolve the source: None → default camera index; digit string → int; else keep as URL/path
+    if args.source is None:
+        source = CAMERA_INDEX
+    elif args.source.isdigit():
+        source = int(args.source)
+    else:
+        source = args.source
+
     print("[INFO] Initializing InsightFace (buffalo_l)…")
     app = build_app()
     registry = load_registry(app)
 
-    cap = cv2.VideoCapture(CAMERA_INDEX)
+    cap = _open_capture(source)
     if not cap.isOpened():
-        print("[ERROR] Cannot open webcam (device 0).")
+        print(f"[ERROR] Cannot open video source: {source!r}")
         sys.exit(1)
 
     # Create a resizable window so the user can drag its edges freely;
@@ -522,7 +572,7 @@ def main() -> None:
     if DISPLAY_SIZE is not None:
         cv2.resizeWindow(WIN_NAME, DISPLAY_SIZE[0], DISPLAY_SIZE[1])
 
-    print("[INFO] Webcam open. Press 'r' to enroll, 'q' to quit.")
+    print("[INFO] Stream open. Press 'r' to enroll, 'q' to quit.")
 
     tracker     = FaceTracker()
     fps         = 0.0
