@@ -20,7 +20,6 @@ from insightface.app import FaceAnalysis
 
 FACES_DB = Path(__file__).parent.parent / "faces_db"
 
-
 def sharpness(img: np.ndarray, bbox) -> float:
     x1, y1, x2, y2 = [max(0, int(v)) for v in bbox]
     roi = img[y1:y2, x1:x2]

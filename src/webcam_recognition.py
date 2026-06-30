@@ -14,6 +14,7 @@ import argparse
 import os
 import platform
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -78,12 +79,12 @@ DET_SIZE      = (1920, 1920) # GPU: upscales 720p 1.5×, stops 0.67× downscale 
 MIN_DET_SCORE         = 0.60  # enrollment gate — strict
 MIN_DET_SCORE_RUNTIME = 0.35  # runtime gate — distant/angled faces score lower
 MIN_SHARPNESS         = 50.0  # enrollment gate — strict
-MIN_SHARPNESS_RUNTIME = 10.0  # runtime gate — distant faces are naturally blurrier
+MIN_SHARPNESS_RUNTIME = 5.0   # runtime gate — RTSP compression reduces apparent sharpness
 SIM_THRESHOLD = 0.45
 ENROLL_FRAMES = 5            # good-quality frames to capture during live enrollment
 
 ZOOM_CROP     = 0.55  # center-crop fraction for 2nd detection pass (0 = disabled)
-TRACK_MAX_AGE = 0.4   # seconds to hold a track after detection disappears (FPS-independent)
+TRACK_MAX_AGE = 1.5   # seconds to hold a track after detection disappears (FPS-independent)
 TRACK_MIN_IOU = 0.30  # min bounding-box overlap to match a detection to an existing track
 INFER_EVERY   = 1     # run full inference every N frames; display uses tracker for skipped frames
 
@@ -180,13 +181,7 @@ def _iou(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def _match_score(track_bbox: np.ndarray, det_bbox: np.ndarray) -> float:
-    """IoU with centroid-distance fallback for fast-moving faces.
-
-    When someone moves quickly the new bbox has low IoU with the old track,
-    causing a stale ghost at the old position.  If the face centre moved less
-    than 2 face-widths we treat it as the same person and return a small
-    positive score so the track is updated rather than abandoned.
-    """
+    """IoU with centroid-distance fallback for fast-moving faces."""
     iou = _iou(track_bbox, det_bbox)
     if iou >= TRACK_MIN_IOU:
         return iou
@@ -194,8 +189,9 @@ def _match_score(track_bbox: np.ndarray, det_bbox: np.ndarray) -> float:
     dc = (det_bbox[:2]  + det_bbox[2:])  * 0.5
     dist = float(np.linalg.norm(tc - dc))
     fw   = float(det_bbox[2] - det_bbox[0])
-    if fw > 0 and dist < fw * 2.0:
-        return max(1e-9, TRACK_MIN_IOU * (1.0 - dist / (fw * 2.0)))
+    # 5× face-width gives enough tolerance for fast walkers in overhead cameras
+    if fw > 0 and dist < fw * 5.0:
+        return max(1e-9, TRACK_MIN_IOU * (1.0 - dist / (fw * 5.0)))
     return 0.0
 
 
@@ -247,6 +243,7 @@ class Track:
         self.score     = score
         self.age       = 0           # frames since last matched (0 = matched this frame)
         self.last_seen = time.time() # wall-clock time of last match (for time-based expiry)
+        self.velocity  = np.zeros(4, dtype=np.float32)  # (dx1,dy1,dx2,dy2) per frame
 
 
 class FaceTracker:
@@ -266,31 +263,43 @@ class FaceTracker:
         for t in self.tracks:
             t.age += 1
 
+        # Predict where each track will be this frame using its last known velocity.
+        # Matching against predicted positions instead of the frozen last-seen position
+        # lets the tracker follow fast-moving people without creating ghost tracks.
+        predictions = {id(t): t.bbox + t.velocity for t in self.tracks}
+
         # Greedy matching — IoU first, centroid-distance fallback for fast movement
         for track in self.tracks:
+            predicted = predictions[id(track)]
             best_score, best_idx = 0.0, -1
             for d_idx, (face, _) in enumerate(detections):
                 if d_idx in matched_det:
                     continue
-                v = _match_score(track.bbox, face.bbox)
+                v = _match_score(predicted, face.bbox)
                 if v > best_score:
                     best_score, best_idx = v, d_idx
 
             if best_idx >= 0:
                 face, (name, score) = detections[best_idx]
+                # Update velocity: exponential moving average of per-frame displacement
+                displacement    = face.bbox - track.bbox
+                track.velocity  = 0.6 * track.velocity + 0.4 * displacement
                 track.bbox      = face.bbox.copy()
                 track.kps       = face.kps.copy()
                 track.age       = 0
-                track.score     = score
                 track.last_seen = now
-                if track.name == "Unknown" and name != "Unknown":
-                    track.name = name  # lock identity once known — prevents flickering
+                # name=None means quality gate failed this frame — update position only,
+                # keep the existing identity so the label doesn't flicker
+                if name is not None:
+                    track.score = score
+                    if track.name == "Unknown" and name != "Unknown":
+                        track.name = name  # lock identity once known
                 matched_det.add(best_idx)
 
         # Unmatched detections → new tracks
         for d_idx, (face, (name, score)) in enumerate(detections):
             if d_idx not in matched_det:
-                self.tracks.append(Track(face.bbox, face.kps, name, score))
+                self.tracks.append(Track(face.bbox, face.kps, name or "Unknown", score))
 
         # Drop tracks not seen within TRACK_MAX_AGE seconds (time-based, FPS-independent)
         self.tracks = [t for t in self.tracks if now - t.last_seen <= TRACK_MAX_AGE]
@@ -447,7 +456,16 @@ def enroll_live(
 # ---------------------------------------------------------------------------
 def annotate_frame(frame: np.ndarray, tracks: list) -> None:
     for track in tracks:
-        x1, y1, x2, y2 = track.bbox.astype(int)
+        # For stale tracks (detection missed this frame), extrapolate the display
+        # position using the last known velocity so the box keeps moving with the
+        # person rather than freezing at the last matched position.
+        if track.age > 0:
+            decay = 0.7 ** track.age  # velocity fades so the box doesn't drift forever
+            display_bbox = track.bbox + track.velocity * track.age * decay
+        else:
+            display_bbox = track.bbox
+        x1, y1, x2, y2 = display_bbox.astype(int)
+
         color     = COLOR_KNOWN if track.name != "Unknown" else COLOR_UNKNOWN
         thickness = 2 if track.age == 0 else 1  # thinner border for held/predicted tracks
 
@@ -535,15 +553,70 @@ def _open_capture(source) -> cv2.VideoCapture:
     is_rtsp = isinstance(source, str) and source.lower().startswith(("rtsp://", "rtsps://"))
 
     if is_rtsp:
-        # Use FFMPEG backend for RTSP; keep buffer small to minimise latency.
+        # TCP transport is more reliable than UDP for H.265/HEVC streams:
+        # UDP drops packets, which causes "Could not find ref with POC N" errors
+        # because P-frames arrive before the I-frame they depend on.
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
         cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        print(f"[INFO] Connecting to RTSP stream: {source}")
+        print(f"[INFO] Connecting to RTSP stream (TCP): {source}")
     else:
         cap = cv2.VideoCapture(source)
         print(f"[INFO] Opening camera index {source}")
 
     return cap
+
+
+class ThreadedCapture:
+    """Wraps VideoCapture with a background reader thread.
+
+    OpenCV's RTSP/FFMPEG backend buffers several network frames internally.
+    Without this, cap.read() in the main loop returns the oldest buffered
+    frame — so by the time you draw a bounding box, the face has already
+    moved.  A background thread continuously drains the buffer; the main
+    loop always gets the most recent decoded frame, eliminating the lag.
+    """
+
+    def __init__(self, cap: cv2.VideoCapture):
+        self._cap    = cap
+        self._ret    = False
+        self._frame  = None
+        self._lock   = threading.Lock()
+        self._stop   = threading.Event()
+        self._thread = threading.Thread(target=self._reader, daemon=True)
+        self._thread.start()
+
+    def _reader(self) -> None:
+        consecutive_errors = 0
+        while not self._stop.is_set():
+            ret, frame = self._cap.read()
+            if ret and frame is not None:
+                consecutive_errors = 0
+                with self._lock:
+                    self._ret   = True
+                    self._frame = frame
+            else:
+                consecutive_errors += 1
+                # Ignore transient H.265 decode errors at stream start (missing reference
+                # frames before the first keyframe arrives).  Only mark the stream as
+                # dead after 60 consecutive failures (~2 s at 30 fps).
+                if consecutive_errors >= 60:
+                    with self._lock:
+                        self._ret = False
+
+    def isOpened(self) -> bool:
+        return self._cap.isOpened()
+
+    def read(self) -> tuple:
+        with self._lock:
+            if self._frame is None:
+                return False, None
+            return self._ret, self._frame.copy()
+
+    def release(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=2.0)
+        self._cap.release()
 
 
 def main() -> None:
@@ -561,7 +634,7 @@ def main() -> None:
     app = build_app()
     registry = load_registry(app)
 
-    cap = _open_capture(source)
+    cap = ThreadedCapture(_open_capture(source))
     if not cap.isOpened():
         print(f"[ERROR] Cannot open video source: {source!r}")
         sys.exit(1)
@@ -582,16 +655,27 @@ def main() -> None:
     while True:
         ret, frame = cap.read()
         if not ret:
-            print("[ERROR] Failed to read frame.")
+            if frame is None:
+                # Background thread hasn't decoded its first keyframe yet
+                # (common at RTSP startup with H.265 streams) — just wait.
+                time.sleep(0.05)
+                continue
+            print("[ERROR] Stream disconnected.")
             break
 
         # Run full inference every INFER_EVERY frames; tracker holds positions for skipped frames
         frame_count += 1
         if frame_count % INFER_EVERY == 0:
-            faces   = detect_with_zoom(app, frame)
-            clear   = [f for f in faces if quality_check(f, frame)]
-            results = [identify(l2(f.embedding), registry) for f in clear]
-            tracker.update(clear, results)
+            faces = detect_with_zoom(app, frame)
+            # Pass ALL detected faces to the tracker so bounding boxes track smoothly
+            # even on blurry/compressed frames.  Identity recognition only runs on
+            # quality-passing faces; others get name=None so the tracker keeps the
+            # existing label instead of resetting to "Unknown".
+            results = [
+                identify(l2(f.embedding), registry) if quality_check(f, frame) else (None, 0.0)
+                for f in faces
+            ]
+            tracker.update(faces, results)
 
         annotate_frame(frame, tracker.tracks)
 

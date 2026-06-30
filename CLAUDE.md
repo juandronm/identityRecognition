@@ -12,7 +12,7 @@ GPU (NVIDIA): keep `onnxruntime-gpu` in `requirements.txt` and install the CUDA 
 CPU-only: swap to `onnxruntime` (comment/uncomment the two lines in `requirements.txt`).
 
 The `buffalo_l` InsightFace model (~400 MB) downloads automatically on first run.
-
++
 ## Running
 
 ```bash
